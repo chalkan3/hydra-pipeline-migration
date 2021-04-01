@@ -1,0 +1,174 @@
+# Maintener: Bruno Teruel    - tbrunots@fastshop.com.br
+# Maintener: Ricardo Peroto  - tjoserp@fastshop.com.br
+# Maintener: Rodrigo Moreira - trodrigom@fastshop.com.br
+
+variables:
+  ENVIRONMENT: $CI_COMMIT_REF_NAME
+  REGION: $AWS_DEFAULT_REGION
+  AWS_ACCESS_KEY_ID_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${AWS_ACCESS_KEY_ID_MASTER}; else echo $${AWS_ACCESS_KEY_ID_DEV}; fi );
+  AWS_SECRET_ACCESS_KEY_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${AWS_SECRET_ACCESS_KEY_MASTER}; else echo $${AWS_SECRET_ACCESS_KEY_DEV}; fi );
+  AWS_REGISTRY_IMAGE_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${AWS_REGISTRY_IMAGE_MASTER}; else echo $${AWS_REGISTRY_IMAGE_DEV}; fi );
+  GITLAB_REGISTRY_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  K8S_FILE_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${K8S_FILE_MASTER}; else echo $${K8S_FILE_DEV}; fi );
+
+
+stages: 
+  - build
+  - sonarqube
+  - docker-build 
+  - tag 
+  - release
+  - deployment
+
+############### Stages de Testes
+build-test:
+  stage: build
+  image: node:12
+  tags:
+    - gitlab-runner-docker01
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    when: always
+    paths:
+      - ./dist/
+  cache:
+    policy: push
+    key: $CI_COMMIT_SHA
+  script:
+    - npm install
+  only:
+    - /feature\/.*/
+    - /fix\/.*/
+    - /hotfix\/.*/
+    - merge_requests
+
+sonarqube:
+  stage: sonarqube
+  dependencies:
+    - build-test
+  image: sonarsource/sonar-scanner-cli
+  variables:
+    SONAR_HOST_URL: "https://sonar.fastshopdigital.com/"
+    SONAR_TOKEN: $SONAR_TOKEN
+    GIT_DEPTH: 0
+  allow_failure: true
+  script:
+    - sonar-scanner  -Dsonar.projectName=$CI_PROJECT_NAME -Dsonar.projectKey=$CI_PROJECT_NAME -Dsonar.qualitygate.wait=true -Dsonar.sources=src
+  tags:
+    - gitlab-runner-docker01
+  only:
+    - merge_requests
+    - develop
+    #- master
+
+
+############### Stages build - release - deploy
+build:
+  stage: build
+  image: node:12
+  tags:
+    - gitlab-runner-docker01
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    when: always
+    paths:
+      - ./dist/
+  cache:
+    policy: push
+    key: $CI_COMMIT_SHA
+  script:
+    - npm install
+    - npm install -g @angular/cli@10.0.5
+    - ng build --configuration=$ENVIRONMENT
+  only:
+    - develop
+    - qa 
+    #- master 
+
+docker-build:
+  stage: docker-build
+  services:
+    - name: docker:dind
+  dependencies:
+    - build
+  cache:
+    policy: pull
+    key: $CI_COMMIT_SHA
+  before_script:
+    - echo $GITLAB_REGISTRY_TAG
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $GITLAB_REGISTRY_TAG .
+    - docker push $GITLAB_REGISTRY_TAG
+  tags:   
+    - gitlab-runner-docker01
+  only:
+    - develop
+    - qa
+    #- master
+
+semantic_tag:
+  stage: tag
+  dependencies: 
+    - docker-build
+  tags:
+    - gitlab-runner-docker01
+  image: node:latest
+  script: 
+    - if [[ $CI_COMMIT_REF_NAME = qa ]]; then TAGNAME="qa-"; fi;
+    - if [[ $CI_COMMIT_REF_NAME = master ]]; then TAGNAME="prod-"; fi;
+    - npm install --silent @semantic-release/gitlab
+    - |
+      npx semantic-release --branches $CI_COMMIT_REF_NAME \
+      -p  '@semantic-release/gitlab' \
+      -t $TAGNAME\${version}
+  only:
+    - qa
+    - master
+
+release:
+  stage: release
+  before_script:
+    - AWS_ACCESS_KEY_ID=$(eval $AWS_ACCESS_KEY_ID_LOGIC)
+    - AWS_SECRET_ACCESS_KEY=$(eval $AWS_SECRET_ACCESS_KEY_LOGIC) 
+    - AWS_REGISTRY_IMAGE=$(eval $AWS_REGISTRY_IMAGE_LOGIC)
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID;
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY;
+    - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $GITLAB_REGISTRY_TAG
+    - docker tag  $GITLAB_REGISTRY_TAG $AWS_REGISTRY_IMAGE/$CI_PROJECT_NAME-$ENVIRONMENT:$CI_COMMIT_SHORT_SHA
+    - docker push $AWS_REGISTRY_IMAGE/$CI_PROJECT_NAME-$ENVIRONMENT:$CI_COMMIT_SHORT_SHA;
+  tags:
+    - gitlab-runner-shell01
+  only:
+    - develop
+    - qa
+    #- master 
+
+
+deploy-k8s-develop:
+  image: 
+    name: bitnami/kubectl:1.17
+    entrypoint: [""]
+  stage: deployment
+  tags:
+    - gitlab-runner-docker01
+  variables:
+    K8S_NAME: $CI_PROJECT_NAME-$CI_COMMIT_REF_NAME
+    TAG: $CI_COMMIT_SHORT_SHA
+    AKAMAI: sellercenter-$CI_COMMIT_REF_NAME
+  script:
+    - K8S_FILE=$(eval $K8S_FILE_LOGIC)
+    - echo -n $K8S_FILE | base64 -d > config
+    - echo $DEPLOY
+    - sed -i "s/\$K8S_NAME/$K8S_NAME/g" ./kubernetes/deployment_$CI_COMMIT_REF_NAME.yaml
+    - sed -i "s/\$TAG/$TAG/g" ./kubernetes/deployment_$CI_COMMIT_REF_NAME.yaml
+    - sed -i "s/\$AKAMAI/$AKAMAI/g" ./kubernetes/deployment_$CI_COMMIT_REF_NAME.yaml
+    - cat ./kubernetes/deployment_$CI_COMMIT_REF_NAME.yaml
+    - kubectl --kubeconfig=config apply -f ./kubernetes/deployment_$CI_COMMIT_REF_NAME.yaml
+  only:
+    - develop
+    - qa
+    #- master

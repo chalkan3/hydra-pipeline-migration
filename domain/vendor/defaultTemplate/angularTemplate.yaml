@@ -1,0 +1,146 @@
+# Corp: Fast Shop S. A. 
+# Maintener: Ricardo Peroto - tjoserp@fastshop.com.br
+# Maintener: Igor Rodrigues - tigorgr@fastshop.com.br
+# Organização: Estabilis
+
+variables:
+    ENVIRONMENT: $CI_COMMIT_REF_NAME
+    AWS_ACCESS_KEY_ID_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${AWS_ACCESS_KEY_ID_MASTER}; else echo $${AWS_ACCESS_KEY_ID_DEV}; fi);
+    AWS_SECRET_ACCESS_KEY_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${AWS_SECRET_ACCESS_KEY_MASTER}; else echo $${AWS_SECRET_ACCESS_KEY_DEV}; fi);
+    S3_ENVIRONMENT_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" != "master" ]; then echo "$S3_BUCKET-$CI_COMMIT_REF_NAME"; else S3_BUCKET; fi);
+    DISTRIBUTION_ID_LOGIC: (if [ "$${CI_COMMIT_REF_NAME}" == "master" ]; then echo $${DISTRIBUTION_ID_MASTER}; elif [ "$${CI_COMMIT_REF_NAME}" == "qa" ]; then echo $${DISTRIBUTION_ID_QA}; else echo $${DISTRIBUTION_ID_DEV}; fi)
+    REGION: $AWS_DEFAULT_REGION
+
+stages:
+  - angular-build
+  - sonarqube
+  - tag
+  - deployment
+
+angular-inspection:
+  stage: angular-build
+  image: node:12
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    when: always
+    paths:
+      - dist/
+  cache:
+    key: $CI_COMMIT_SHA
+    paths:
+      - dist/
+      - node_modules/
+  services:
+      - name: docker:dind
+  before_script:
+    - npm install --silent
+    - npm i -g @angular-devkit/build-angular@0.803.21
+    - npm i -g @angular/cli@8.3.21
+    - npm i -g @angular/common@8.2.14
+    - npm i -g ngx-cookie-service 
+    - ng version
+  script:
+     - ng build --configuration=local
+  tags:
+    - gitlab-runner-docker01
+  only:
+    - /feature\/.*/
+    - /fix\/.*/
+    - /hotfix\/.*/
+
+angular-build:
+  stage: angular-build
+  image: node:latest
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    when: always
+    paths:
+      - dist/
+  cache:
+    key: $CI_COMMIT_SHA
+    paths:
+      - dist/
+  services:
+      - name: docker:dind
+  before_script:
+    - npm install
+    - npm i -g @angular-devkit/build-angular
+    - npm i -g @angular/cli
+    - ng version 
+  script:
+     - ng build --configuration=$ENVIRONMENT  
+  tags:
+    - gitlab-runner-docker01
+  only:
+    - develop
+    - master
+    - staging
+    - qa 
+
+sonarqube:
+    stage: sonarqube
+    dependencies:
+      - angular-build
+    image: sonarsource/sonar-scanner-cli
+    variables:
+      SONAR_HOST_URL: "https://sonar.fastshopdigital.com/"
+      SONAR_TOKEN: $SONAR_TOKEN
+      GIT_DEPTH: 0
+    script:
+      - sonar-scanner -Dsonar.projectName=$CI_PROJECT_NAME -Dsonar.qualitygate.wait=true -Dsonar.projectKey=$CI_PROJECT_NAME -Dsonar.sources=src
+    allow_failure: true
+    tags:
+      - gitlab-runner-docker01
+    only:
+      - develop
+      - merge_requests
+
+semantic_tag:
+  stage: tag
+  dependencies: 
+    - angular-build
+  tags:
+    - gitlab-runner-docker01
+  image: node:latest
+  script: 
+    - if [[ $CI_COMMIT_REF_NAME = qa ]]; then TAGNAME="qa-"; fi;
+    - if [[ $CI_COMMIT_REF_NAME = master ]]; then TAGNAME="prod-"; fi;
+    - npm install --silent @semantic-release/gitlab
+    - |
+      npx semantic-release --branches $CI_COMMIT_REF_NAME \
+      -p  '@semantic-release/gitlab' \
+      -t $TAGNAME\${version}
+  only:
+    - qa
+    - master
+
+  
+deployment:
+  stage: deployment
+  image: ubuntu:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "qa" 
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: on_success
+  before_script:
+    - MAP_DISTRIBUTION_ID=(["master"]=$DISTRIBUTION_ID_MASTER ["qa"]=$DISTRIBUTION_ID_QA ["develop"]=$DISTRIBUTION_ID_DEV)
+    - AWS_ACCESS_KEY_ID=$(eval $AWS_ACCESS_KEY_ID_LOGIC)
+    - AWS_SECRET_ACCESS_KEY=$(eval $AWS_SECRET_ACCESS_KEY_LOGIC)
+    - DISTRIBUTION_ID=$(eval $DISTRIBUTION_ID_LOGIC)
+    - S3_ENVIRONMENT=$(eval $S3_ENVIRONMENT_LOGIC)
+    - apt-get update && apt install curl -y && apt install zip -y
+    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    - unzip awscliv2.zip
+    - ./aws/install
+    - aws --version
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID;
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY;
+  script:
+    - aws s3 cp dist/ s3://$S3_ENVIRONMENT.fastshop.com.br --recursive
+    - aws cloudfront create-invalidation  --distribution-id $DISTRIBUTION_ID  --paths "/*"
+  tags:
+    - gitlab-runner-docker01
+

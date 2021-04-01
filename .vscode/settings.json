@@ -1,0 +1,21 @@
+{
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "infra/provider/containerProvider.go": true,
+        "infra/handler": true,
+        "cmd/commom": true,
+        "cmd/interfaces": true,
+        "infra/provider/interfaces": true,
+        "infra/helpers": true,
+        "cmd/cmds.go": true,
+        "**/go.mod": true,
+        "**/go.sum": true,
+        "domain/Constants": true,
+        "**/.vscode": true
+    },
+    "explorerExclude.backup": null
+}
